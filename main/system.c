@@ -1,0 +1,871 @@
+#include <inttypes.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/time.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_check.h"
+
+#include "driver/gpio.h"
+#include "esp_app_desc.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "lwip/inet.h"
+
+#include "system.h"
+#include "connect.h"
+#include "nvs_config.h"
+#include "nvs_device.h"
+#include "eeprom.h"
+#include "gpio_input_output.h"
+#include "asic.h"
+#include "lvgl_porting.h"
+#include "device.h"
+#include "esp_mac.h"
+
+static const char * TAG = "SystemModule";
+
+static void _suffix_string(uint64_t, char *, size_t, int);
+
+static esp_netif_t * netif;
+static char sn_str[24] = {0};
+static double found_nonce_time_stamps = 0;
+
+//local function prototypes
+//static esp_err_t ensure_overheat_mode_config();
+
+static void _check_for_best_diff(GlobalState * GLOBAL_STATE, double diff, uint8_t job_id);
+static void _suffix_string(uint64_t val, char * buf, size_t bufsiz, int sigdigits);
+
+void SYSTEM_init_system(GlobalState * GLOBAL_STATE)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    module->duration_start = 0;
+    module->historical_hashrate_rolling_index = 0;
+    module->historical_hashrate_init = 0;
+    module->current_hashrate = 0;
+    module->screen_page = 0;
+    module->shares_accepted = 0;
+    module->shares_rejected = 0;
+    module->best_nonce_diff = nvs_config_get_u64(NVS_CONFIG_BEST_DIFF, 0);
+    module->best_session_nonce_diff = 0;
+    module->start_time = esp_timer_get_time();
+    module->lastClockSync = 0;
+    module->FOUND_BLOCK = false;
+    module->BLOCK_NUM = nvs_config_get_u16(NVS_CONFIG_BLOCK_NUM, 0);
+    
+    // set the pool url
+    module->pool_url = nvs_config_get_string(NVS_CONFIG_STRATUM_URL, CONFIG_STRATUM_URL);
+    module->fallback_pool_url = nvs_config_get_string(NVS_CONFIG_FALLBACK_STRATUM_URL, CONFIG_FALLBACK_STRATUM_URL);
+
+    // set the pool port
+    module->pool_port = nvs_config_get_u16(NVS_CONFIG_STRATUM_PORT, CONFIG_STRATUM_PORT);
+    module->fallback_pool_port = nvs_config_get_u16(NVS_CONFIG_FALLBACK_STRATUM_PORT, CONFIG_FALLBACK_STRATUM_PORT);
+
+    // set the pool user
+    module->pool_user = nvs_config_get_string(NVS_CONFIG_STRATUM_USER, CONFIG_STRATUM_USER);
+    module->fallback_pool_user = nvs_config_get_string(NVS_CONFIG_FALLBACK_STRATUM_USER, CONFIG_FALLBACK_STRATUM_USER);
+
+    // set the pool password
+    module->pool_pass = nvs_config_get_string(NVS_CONFIG_STRATUM_PASS, CONFIG_STRATUM_PW);
+    module->fallback_pool_pass = nvs_config_get_string(NVS_CONFIG_FALLBACK_STRATUM_PASS, CONFIG_FALLBACK_STRATUM_PW);
+
+    // set fallback to false.
+    module->is_using_fallback = false;
+
+    // Initialize overheat_mode
+    module->overheat_mode = 0;//nvs_config_get_u16(NVS_CONFIG_OVERHEAT_MODE, 0);
+    module->is_network_error = false;
+    //ESP_LOGI(TAG, "Initial overheat_mode value: %d", module->overheat_mode);
+
+    // Initialize boot_mode
+    module->boot_mode = nvs_config_get_u16(NVS_CONFIG_BOOT_MODE, 0);
+    ESP_LOGI(TAG, "boot_mode value: %d", module->boot_mode);
+
+    //Initialize power_fault fault mode
+    module->power_fault = 0;
+
+    // set the best diff string
+    _suffix_string(module->best_nonce_diff, module->best_diff_string, DIFF_STRING_SIZE, 0);
+    _suffix_string(module->best_session_nonce_diff, module->best_session_diff_string, DIFF_STRING_SIZE, 0);
+
+    // set the ssid string to blank
+    memset(module->ssid, 0, sizeof(module->ssid));
+
+    // set the wifi_status to blank
+    memset(module->wifi_status, 0, 20);
+    module->system_error = NULL;
+
+    module->sn[0] = nvs_config_get_string(NVS_CONFIG_SN, "AL");//"ALDC02ABC0001"
+    if(strlen(module->sn[0]) < 4)
+    {
+        uint8_t mac [6] = {0};
+        esp_read_mac(mac,ESP_MAC_WIFI_STA);
+        snprintf(sn_str,sizeof(sn_str)-1,"%s%s%02X%02X%02X%02X%02X%02X", module->sn[0],GLOBAL_STATE->device_model_str,
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        if(module->sn[0])
+            free(module->sn[0]);
+        module->sn[0] = sn_str;
+    }
+    else
+    {
+        strncpy(sn_str, module->sn[0], sizeof(sn_str)-1); 
+        sn_str[sizeof(sn_str)-1] = '\0';
+    }
+    ESP_LOGI(TAG, "SN %s", sn_str);
+
+    module->username = nvs_config_get_string(NVS_CONFIG_USERNAME, "root");
+    module->password = nvs_config_get_string(NVS_CONFIG_PASSWORD, "root");
+    ESP_LOGI(TAG, "password is %s", module->password);
+}
+
+char * SYSTEM_get_sn(void)
+{
+    return sn_str;
+}
+
+esp_err_t SYSTEM_get_config_by_boot_mode(GlobalState * GLOBAL_STATE){
+    esp_err_t ret = ESP_OK;
+    uint16_t boot_mode = GLOBAL_STATE->SYSTEM_MODULE.boot_mode;
+
+    if(NORMAL_MODE == boot_mode){
+        ESP_LOGI(TAG, "Normal Mode....");
+        //GLOBAL_STATE->asic_freqency = CONFIG_ASIC_FREQUENCY;
+        GLOBAL_STATE->asic_freqency = nvs_config_get_u16(NVS_CONFIG_ASIC_NORMAL_FREQ, CONFIG_ASIC_FREQUENCY);
+        //GLOBAL_STATE->HEALTH_MODULE.voltage = (float)CONFIG_ASIC_VOLTAGE;
+        GLOBAL_STATE->HEALTH_MODULE.voltage = (float)nvs_config_get_u16(NVS_CONFIG_ASIC_NORMAL_VOLTAGE, CONFIG_ASIC_VOLTAGE);
+        ESP_LOGI(TAG, "asic frequency %.0f", (float)GLOBAL_STATE->asic_freqency);
+        ESP_LOGI(TAG, "asic voltage %.0f", GLOBAL_STATE->HEALTH_MODULE.voltage);
+    }else if(USER_CUSTOMIZED_MODE == boot_mode){
+        ESP_LOGI(TAG, "User Custmized Mode...");
+        ret = NVSDevice_update_freq_voltage(GLOBAL_STATE);
+    }else if(DEMO_DEBUG_MODE == boot_mode){
+        ESP_LOGI(TAG, "Debug Mode...");
+        ret = NVSDevice_update_freq_voltage(GLOBAL_STATE);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Mode %d",boot_mode);
+        ret = NVSDevice_update_freq_voltage(GLOBAL_STATE);
+    }
+
+    if(GLOBAL_STATE->asic_freqency < 700 || GLOBAL_STATE->asic_freqency > 2600)
+    {
+        ESP_LOGW(TAG, "freqency %f unsupport, set default %d",(float)GLOBAL_STATE->asic_freqency,CONFIG_ASIC_FREQUENCY);
+        GLOBAL_STATE->asic_freqency = CONFIG_ASIC_FREQUENCY;
+    }
+
+    if((GLOBAL_STATE->HEALTH_MODULE.voltage < GLOBAL_STATE->asic_vol_min) || 
+    (GLOBAL_STATE->HEALTH_MODULE.voltage > GLOBAL_STATE->asic_vol_max))
+    {
+        ESP_LOGW(TAG, "voltage %.0f unsupport",GLOBAL_STATE->HEALTH_MODULE.voltage);
+        if(GLOBAL_STATE->asic_vol_max > 150)
+        {
+            GLOBAL_STATE->HEALTH_MODULE.voltage = (float)CONFIG_ASIC_VOLTAGE*2;
+        }
+        else
+        {
+            GLOBAL_STATE->HEALTH_MODULE.voltage = (float)CONFIG_ASIC_VOLTAGE;
+        }
+        ESP_LOGW(TAG, "set default %.0f",GLOBAL_STATE->HEALTH_MODULE.voltage);
+    }
+    return ret;
+}
+
+esp_err_t SYSTEM_init_peripherals(GlobalState * GLOBAL_STATE) {
+    /*
+    ESP_RETURN_ON_ERROR(gpio_install_isr_service(0), TAG, "Error installing ISR service");
+
+    // Initialize the core voltage regulator
+    ESP_RETURN_ON_ERROR(VCORE_init(GLOBAL_STATE), TAG, "VCORE init failed!");
+    ESP_RETURN_ON_ERROR(VCORE_set_voltage(nvs_config_get_u16(NVS_CONFIG_ASIC_VOLTAGE, CONFIG_ASIC_VOLTAGE) / 1000.0, GLOBAL_STATE), TAG, "VCORE set voltage failed!");
+
+    ESP_RETURN_ON_ERROR(Thermal_init(GLOBAL_STATE->device_model, nvs_config_get_u16(NVS_CONFIG_INVERT_FAN_POLARITY, 1)), TAG, "Thermal init failed!");
+
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+
+    // Ensure overheat_mode config exists
+    ESP_RETURN_ON_ERROR(ensure_overheat_mode_config(), TAG, "Failed to ensure overheat_mode config");
+
+    //Init the DISPLAY
+    switch (GLOBAL_STATE->device_model) {
+        case DEVICE_MAX:
+        case DEVICE_ULTRA:
+        case DEVICE_SUPRA:
+        case DEVICE_GAMMA:
+        case DEVICE_GAMMATURBO:    if (module->historical_hashrate_init < HISTORY_LENGTH) {
+        module->historical_hashrate_init++;
+    } else {
+        module->duration_start =
+            module->historical_hashrate_time_stamps[(module->historical_hashrate_rolling_index + 1) % HISTORY_LENGTH];
+    }
+    double sum = 0;
+    for (int i = 0; i < module->historical_hashrate_init; i++) {
+        sum += module->historical_hashrate[i];
+    }
+
+    double duration = (double) (esp_timer_get_time() - module->duration_start) / 1000000;
+            // display
+            if (display_init(GLOBAL_STATE) != ESP_OK || !GLOBAL_STATE->SYSTEM_MODULE.is_screen_active) {
+                ESP_LOGW(TAG, "OLED init failed!");
+            } else {
+                ESP_LOGI(TAG, "OLED init success!");
+            }
+            break;
+        default:
+    }
+
+    ESP_RETURN_ON_ERROR(input_init(screen_next, toggle_wifi_softap), TAG, "Input init failed!");
+
+    ESP_RETURN_ON_ERROR(screen_start(GLOBAL_STATE), TAG, "Screen start failed!");
+    */
+    netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+    return ESP_OK;
+}
+
+void SYSTEM_notify_get_work(GlobalState * GLOBAL_STATE)
+{
+    SYSTEM_notify_status_change(GLOBAL_STATE, SYSTEM_NORMAL_MINING);
+}
+
+void SYSTEM_notify_accepted_share(GlobalState * GLOBAL_STATE)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    module->shares_accepted++;
+    SYSTEM_notify_status_change(GLOBAL_STATE, SYSTEM_NORMAL_MINING);
+}
+
+static int compare_rejected_reason_stats(const void *a, const void *b) {
+    const RejectedReasonStat *ea = a;
+    const RejectedReasonStat *eb = b;
+    return (eb->count > ea->count) - (ea->count > eb->count);
+}
+
+void SYSTEM_notify_rejected_share(GlobalState * GLOBAL_STATE, char * error_msg)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    module->shares_rejected++;
+
+    if(error_msg)
+    {
+        for (int i = 0; i < module->rejected_reason_stats_count; i++) {
+            if (strncmp(module->rejected_reason_stats[i].message, error_msg, sizeof(module->rejected_reason_stats[i].message) - 1) == 0) {
+                module->rejected_reason_stats[i].count++;
+                return;
+            }
+        }
+
+        if (module->rejected_reason_stats_count < sizeof(module->rejected_reason_stats)) {
+            strncpy(module->rejected_reason_stats[module->rejected_reason_stats_count].message, 
+                    error_msg, 
+                    sizeof(module->rejected_reason_stats[module->rejected_reason_stats_count].message) - 1);
+            module->rejected_reason_stats[module->rejected_reason_stats_count].message[sizeof(module->rejected_reason_stats[module->rejected_reason_stats_count].message) - 1] = '\0'; // Ensure null termination
+            module->rejected_reason_stats[module->rejected_reason_stats_count].count = 1;
+            module->rejected_reason_stats_count++;
+        }
+
+        if (module->rejected_reason_stats_count > 1) {
+            qsort(module->rejected_reason_stats, module->rejected_reason_stats_count, 
+                sizeof(module->rejected_reason_stats[0]), compare_rejected_reason_stats);
+        }  
+    }
+}
+
+void SYSTEM_notify_mining_started(GlobalState * GLOBAL_STATE)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    module->duration_start = esp_timer_get_time();
+    module->historical_hashrate_rolling_index = 0;
+    module->historical_hashrate[0] = 0;
+    module->historical_hashrate_time_stamps[0] = 0;
+    //module->rec_nonce[0] = 0;
+    //module->rec_nonce[1] = 0;
+}
+
+void SYSTEM_notify_new_ntime(GlobalState * GLOBAL_STATE, uint32_t ntime)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    // Hourly clock sync
+    if (module->lastClockSync + (60 * 60) > ntime) {
+        return;
+    }
+    ESP_LOGD(TAG, "Syncing clock");
+    module->lastClockSync = ntime;
+    struct timeval tv;
+    tv.tv_sec = ntime;
+    tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
+}
+
+void SYSTEM_notify_found_nonce(
+    GlobalState * GLOBAL_STATE, double found_diff, 
+    uint8_t job_id, uint8_t chain_id, uint8_t chip_id, uint8_t core_id)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    // Calculate the time difference in seconds with sub-second precision
+    // hashrate = (nonce_difficulty * 2^32) / time_to_find
+
+    #ifdef HW_STATISTIC_FEATURE
+    module->recveived_nonce += 1;
+    #if 0
+    if(module->recveived_nonce == 100)
+    {
+        module->FOUND_BLOCK = true;
+        module->BLOCK_NUM ++;
+    }
+    #endif
+    #endif
+
+    found_nonce_time_stamps = esp_timer_get_time();
+
+    #if 1
+    double time_durationps = found_nonce_time_stamps - module->duration_start;
+
+    module->historical_hashrate[module->historical_hashrate_rolling_index] += GLOBAL_STATE->asic_difficulty;
+    module->historical_hashrate_time_stamps[module->historical_hashrate_rolling_index] = time_durationps;
+
+    double sum_hashrate = module->historical_hashrate[module->historical_hashrate_rolling_index] ;
+    double sun_time = module->historical_hashrate_time_stamps[module->historical_hashrate_rolling_index];
+
+    if(time_durationps >= 10000000)
+    {
+        module->historical_hashrate_rolling_index = (module->historical_hashrate_rolling_index + 1) % HISTORY_LENGTH;
+        module->historical_hashrate[module->historical_hashrate_rolling_index] = 0;
+        module->historical_hashrate_time_stamps[module->historical_hashrate_rolling_index] = 0;
+        module->duration_start = found_nonce_time_stamps;
+        if (module->historical_hashrate_init < HISTORY_LENGTH) {
+            module->historical_hashrate_init++;
+        }
+        //ESP_LOGI(TAG, "hash %.1f, time %.1f, init %d, num %lld", sum_hashrate, sun_time/1000000,
+        //    module->historical_hashrate_init,module->recveived_nonce);
+    }
+
+    for (int i = 0; i < module->historical_hashrate_init; i++) {
+        sum_hashrate += module->historical_hashrate[i];
+        sun_time += module->historical_hashrate_time_stamps[i];
+    }
+    
+    module->current_hashrate = (sum_hashrate * 65536) / (sun_time * 1000);
+
+    #else
+
+    module->historical_hashrate[module->historical_hashrate_rolling_index] = GLOBAL_STATE->asic_difficulty;
+    module->historical_hashrate_time_stamps[module->historical_hashrate_rolling_index] = esp_timer_get_time();
+    module->historical_hashrate_rolling_index = (module->historical_hashrate_rolling_index + 1) % HISTORY_LENGTH;
+
+    // ESP_LOGI(TAG, "nonce_diff %.1f, ttf %.1f, res %.1f", nonce_diff, duration,
+    // historical_hashrate[historical_hashrate_rolling_index]);
+
+    if (module->historical_hashrate_init < HISTORY_LENGTH) {
+        module->historical_hashrate_init++;
+    } else {
+        module->duration_start =
+            module->historical_hashrate_time_stamps[(module->historical_hashrate_rolling_index + 1) % HISTORY_LENGTH];
+    }
+    double sum = 0;
+    for (int i = 0; i < module->historical_hashrate_init; i++) {
+        sum += module->historical_hashrate[i];
+    }
+
+    double duration = (double) (esp_timer_get_time() - module->duration_start) / 1000000;
+#ifdef BTC
+    double rolling_rate = (sum * 4294967296) / (duration * 1000000000);
+    if (module->historical_hashrate_init < HISTORY_LENGTH) {
+        module->current_hashrate = rolling_rate;
+    } else {
+        // More smoothing
+        module->current_hashrate = ((module->current_hashrate * 9) + rolling_rate) / 10;
+    }
+#else
+    double rolling_rate = (sum * 65536) / (duration * 1000000000);
+    if (module->historical_hashrate_init < HISTORY_LENGTH) {
+        module->current_hashrate = rolling_rate;
+    } else {
+        // More smoothing
+        module->current_hashrate = ((module->current_hashrate * 11) + rolling_rate) / 12;
+    }
+#endif
+#endif
+    // logArrayContents(historical_hashrate, HISTORY_LENGTH);
+    // logArrayContents(historical_hashrate_time_stamps, HISTORY_LENGTH);
+    if(module->shares_accepted)
+    _check_for_best_diff(GLOBAL_STATE, found_diff, job_id);
+}
+
+void SYSTEM_notify_hw(GlobalState * GLOBAL_STATE, uint8_t chain_id, uint8_t chip_id, uint8_t core_id)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+    module->recveived_hw += 1;
+
+
+    #define ASIC_NUM   0
+
+    #if ASIC_NUM
+
+    static uint32_t hw[ASIC_NUM] = {0};
+    static uint32_t hw_info[ASIC_NUM][255] = {0};
+    uint8_t addr_interval = 0x100 / ASIC_NUM;
+    uint8_t chip_id_index = chip_id / addr_interval;
+
+    hw[chip_id_index] += 1;
+    hw_info[chip_id_index][core_id] += 1;
+
+    ESP_LOGI(TAG, "hw %lld, chip id %d, core id %d", module->recveived_hw, chip_id, core_id);
+    
+    static uint64_t  log_time = 0;
+    if(esp_timer_get_time()-log_time > 10000000)
+    {
+        log_time = esp_timer_get_time();
+        #if ASIC_NUM == 2
+        ESP_LOGI(TAG, "hw_all %lld, chip id: %ld, %ld", module->recveived_hw, hw[0], hw[1]);
+        #elif ASIC_NUM == 4
+        ESP_LOGI(TAG, "hw_all %lld, chip id: %ld, %ld, %ld, %ld", module->recveived_hw, hw[0], hw[1],hw[2], hw[3]);
+        #endif
+
+        ESP_LOGI(TAG, "hw_info:");
+        for(int j=0;j<ASIC_NUM;j++)
+        {
+            ESP_LOGI(TAG, "chip id index: %d", j);
+            for(int i=0;i<255;i++)
+            {
+                if(hw_info[j][i])
+                    ESP_LOGI(TAG, "hw_info:core id %d, num: %d",i,hw_info[j][i]);
+            }
+        }
+    }
+    #endif
+}
+
+void SYSTEM_notify_error_info(
+    GlobalState * GLOBAL_STATE, SYSTEM_ERROR system_err, const char* error_info)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    if(system_err >= SYSTEM_ERROR_MAX_NUM){
+        ESP_LOGW(TAG, "system get a unknown error info.");
+        return;
+    }
+
+    if(NULL != module->system_error){
+        free(module->system_error);
+    }
+
+    switch (system_err)
+    {
+    case WRONG_ASIC_ERROR:
+        module->system_error = strdup("Wrong asic error");
+        inform_led(MSG_HASHBOARD_ERROR);
+        break;
+    
+    case FAN_ERROR:
+        module->system_error = strdup("fan error");
+        inform_led(MSG_FAN_ERROR);
+        break;
+    
+    case EEPROM_ERROR:
+        module->system_error = strdup("eeprom error");
+        inform_led(MSG_EEPROM_ERROR);
+        break;
+
+    case CONTROL_SYSTEM_ERROR:
+        module->system_error = strdup("system error");
+        inform_led(MSG_CONTROLBOARD_ERROR);
+        break;
+
+    case CONFIG_FILE_ERROR:
+        module->system_error = strdup("config file error");
+        inform_led(MSG_CONTROLBOARD_ERROR);
+        break;
+    
+    case HIGH_TEMPERATURE_ERROR:
+        module->system_error = strdup("temperature error");
+        inform_led(MSG_HASHBOARD_ERROR);
+        break;
+
+    case HASHRATE_ERROR:
+        module->system_error = strdup("hashrate error");
+        inform_led(MSG_HASHBOARD_ERROR);
+        break;
+    
+    case NETWORK_ERROR:
+        module->system_error = strdup("network error");
+        module->is_network_error = true;
+        hideErrorScreen();
+        inform_led(MSG_NETWORK_ERROR);
+        break;
+
+    case WIFI_CONNETION_ERROR:
+        module->system_error = strdup("wifi error");
+        inform_led(MSG_NETWORK_ERROR);
+        
+        refresh_portal_data_from_system();
+        inform_wifi_status(false);
+        break;
+
+    case SPECIAL_ERROR:
+        module->system_error = strdup(error_info);
+        inform_led(MSG_HASHBOARD_ERROR);
+        break;
+    
+    default:
+        break;
+    }
+
+    /*Change the system status*/
+    module->system_status = SYSTEM_ERROR_STATUS;
+    //showErrorScreen(module->system_error,system_err);
+    ESP_LOGW(TAG, "system get a error %d, %s.",system_err, module->system_error);
+}
+
+void SYSTEM_notify_status_change(GlobalState * GLOBAL_STATE, SYSTEM_SATUS new_status)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    if(new_status >= SYSTEM_SATUS_MAX_NUM){
+        ESP_LOGW(TAG, "system get a unknown status.");
+        return;
+    }
+    //ESP_LOGD(TAG, "status change: %d", new_status);
+
+    module->system_status = new_status;
+    switch (module->system_status)
+    {
+        case SYSTEM_BOOT_UP:
+            inform_led(MSG_NORMAL_BOOTING);
+            break;
+        case SYSTEM_WIFI_CONNECTED:
+            inform_led(MSG_WIFI_CONNECTED);
+            inform_wifi_status(true);
+            break;
+        case SYSTEM_NORMAL_MINING:
+            inform_led(MSG_NORMAL_MINING);
+            inform_mining_status();
+            
+            /*clear all the error.*/
+            if(NULL != module->system_error){
+                free(module->system_error);
+                module->system_error = strdup("");
+            }
+            module->is_network_error = false;
+            break;       
+        default:
+            break;
+    }  
+}
+
+
+static double _calculate_network_difficulty(uint32_t nBits)
+{
+    uint32_t mantissa = nBits & 0x007fffff;  // Extract the mantissa from nBits
+    uint8_t exponent = (nBits >> 24) & 0xff; // Extract the exponent from nBits
+
+    double target = (double) mantissa * pow(256, (exponent - 3)); // Calculate the target value
+
+    double difficulty = (pow(2, 208) * 65535) / target; // Calculate the difficulty
+
+    return difficulty;
+}
+
+double litecoin_difficulty_from_bits_simple(uint32_t nBits) {
+    // 这是一个在社区广泛使用的简化公式
+    int shift = (nBits >> 24) & 0xff;
+    double diff = (double)0x0000ffff / (double)(nBits & 0x00ffffff);
+    while (shift < 29) {
+        diff *= 256.0;
+        shift++;
+    }
+    while (shift > 29) {
+        diff /= 256.0;
+        shift--;
+    }
+    return diff;
+}
+
+static void _check_for_best_diff(GlobalState * GLOBAL_STATE, double diff, uint8_t job_id)
+{
+    SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
+
+    //if(diff > 65536)
+    {
+        diff = diff / 65536;
+    }
+
+    if ((uint64_t) diff > module->best_session_nonce_diff) {
+        module->best_session_nonce_diff = (uint64_t) diff;
+        _suffix_string((uint64_t) diff, module->best_session_diff_string, DIFF_STRING_SIZE, 0);
+        if(diff > 1000000)
+        ESP_LOGI(TAG, "BD %.0f", diff);
+    }
+
+    if(diff > 1000000)
+    {
+        double network_diff = _calculate_network_difficulty(GLOBAL_STATE->ASIC_TASK_MODULE[0].active_jobs[job_id]->target);
+        //double network_diff = (double)(GLOBAL_STATE->stratum_difficulty);
+        if (diff > network_diff) {
+            #if 0
+            module->FOUND_BLOCK = true;
+            module->BLOCK_NUM ++;
+            ESP_LOGI(TAG, "FOUND BLOCK!!!!!!!!!!!!!!!!!!!!!! %f > %f", diff, network_diff);
+            #else
+            ESP_LOGI(TAG, "DIFF %f > %f, 0x%" PRIx32 "", diff, network_diff,GLOBAL_STATE->ASIC_TASK_MODULE[0].active_jobs[job_id]->target);
+            #endif
+        }
+    }
+
+    if ((uint64_t) diff <= module->best_nonce_diff) {
+        return;
+    }
+    module->best_nonce_diff = (uint64_t) diff;
+
+    nvs_config_set_u64(NVS_CONFIG_BEST_DIFF, module->best_nonce_diff);
+
+    // make the best_nonce_diff into a string
+    _suffix_string((uint64_t) diff, module->best_diff_string, DIFF_STRING_SIZE, 0);
+
+    ESP_LOGI(TAG, "best_nonce_diff: %.0f", diff);
+}
+
+/* Convert a uint64_t value into a truncated string for displaying with its
+ * associated suitable for Mega, Giga etc. Buf array needs to be long enough */
+static void _suffix_string(uint64_t val, char * buf, size_t bufsiz, int sigdigits)
+{
+    const double dkilo = 1000.0;
+    const uint64_t kilo = 1000ull;
+    const uint64_t mega = 1000000ull;
+    const uint64_t giga = 1000000000ull;
+    const uint64_t tera = 1000000000000ull;
+    const uint64_t peta = 1000000000000000ull;
+    const uint64_t exa = 1000000000000000000ull;
+    char suffix[2] = "";
+    bool decimal = true;
+    double dval;
+
+    if (val >= exa) {
+        val /= peta;
+        dval = (double) val / dkilo;
+        strcpy(suffix, "E");
+    } else if (val >= peta) {
+        val /= tera;
+        dval = (double) val / dkilo;
+        strcpy(suffix, "P");
+    } else if (val >= tera) {
+        val /= giga;
+        dval = (double) val / dkilo;
+        strcpy(suffix, "T");
+    } else if (val >= giga) {
+        val /= mega;
+        dval = (double) val / dkilo;
+        strcpy(suffix, "G");
+    } else if (val >= mega) {
+        val /= kilo;
+        dval = (double) val / dkilo;
+        strcpy(suffix, "M");
+    } else if (val >= kilo) {
+        dval = (double) val / dkilo;
+        strcpy(suffix, "k");
+    } else {
+        dval = val;
+        decimal = false;
+    }
+
+    if (!sigdigits) {
+        if (decimal)
+            snprintf(buf, bufsiz, "%.3g%s", dval, suffix);
+        else
+            snprintf(buf, bufsiz, "%d%s", (unsigned int) dval, suffix);
+    } else {
+        /* Always show sigdigits + 1, padded on right with zeroes
+         * followed by suffix */
+        int ndigits = sigdigits - 1 - (dval > 0.0 ? floor(log10(dval)) : 0);
+
+        snprintf(buf, bufsiz, "%*.*f%s", sigdigits + 1, ndigits, dval, suffix);
+    }
+}
+
+#if 0
+static esp_err_t ensure_overheat_mode_config() {
+    uint16_t overheat_mode = nvs_config_get_u16(NVS_CONFIG_OVERHEAT_MODE, UINT16_MAX);
+
+    if (overheat_mode == UINT16_MAX) {
+        // Key doesn't exist or couldn't be read, set the default value
+        nvs_config_set_u16(NVS_CONFIG_OVERHEAT_MODE, 0);
+        ESP_LOGI(TAG, "Default value for overheat_mode set to 0");
+    } else {
+        // Key exists, log the current value
+        ESP_LOGI(TAG, "Existing overheat_mode value: %d", overheat_mode);
+    }
+
+    return ESP_OK;
+}
+#endif
+
+/**
+ * @brief 将秒数转换为易读的时间格式字符串
+ * @param total_seconds 总秒数
+ * @param buffer 输出缓冲区
+ * @param buffer_size 缓冲区大小
+ * @param show_seconds 是否显示秒数
+ * @return 成功返回true，失败返回false
+ */
+bool format_seconds_to_string(uint32_t total_seconds, char* buffer, size_t buffer_size, bool show_seconds) {
+    if (buffer == NULL || buffer_size < 12) {
+        ESP_LOGE(TAG, "Invalid buffer or buffer too small");
+        return false;
+    }
+    
+    unsigned int  days = total_seconds / 86400;
+    unsigned int  hours = (total_seconds % 86400) / 3600;
+    unsigned int  minutes = (total_seconds % 3600) / 60;
+    unsigned int  seconds = total_seconds % 60;
+    
+    int chars_written;
+    
+    if (days > 0) {
+        if (show_seconds) {
+            chars_written = snprintf(buffer, buffer_size, "%ud %uh %um %us", 
+                                   days, hours, minutes, seconds);
+        } else {
+            chars_written = snprintf(buffer, buffer_size, "%ud %uh %um", 
+                                   days, hours, minutes);
+        }
+    } else if (hours >= 0) {
+        if (show_seconds) {
+            chars_written = snprintf(buffer, buffer_size, "%uh %um %us", 
+                                   hours, minutes, seconds);
+        } else {
+            chars_written = snprintf(buffer, buffer_size, "%uh %um", 
+                                   hours, minutes);
+        }
+    } else if (minutes >= 0) {
+        if (show_seconds) {
+            chars_written = snprintf(buffer, buffer_size, "%um %us", 
+                                   minutes, seconds);
+        } else {
+            chars_written = snprintf(buffer, buffer_size, "%um", minutes);
+        }
+    } else {
+        if (show_seconds) {
+            chars_written = snprintf(buffer, buffer_size, "%us", seconds);
+        } else {
+            chars_written = snprintf(buffer, buffer_size, "0m");
+        }
+    }
+    
+    return (chars_written > 0 && (size_t)chars_written < buffer_size);
+}
+
+void system_task(void *pvParameters) 
+{
+    ESP_LOGI("system task", "system_task started");
+
+    GlobalState * GLOBAL_STATE = (GlobalState *) pvParameters;
+    uint16_t block_num = GLOBAL_STATE->SYSTEM_MODULE.BLOCK_NUM;
+    uint32_t log_time = 0;
+    double current_hashrate_max = 0;
+    uint16_t hashrate_time_count = 0;
+    
+    while (1) 
+    {
+        #if 1
+        if(GLOBAL_STATE->SYSTEM_MODULE.FOUND_BLOCK)
+        {
+            if(block_num != GLOBAL_STATE->SYSTEM_MODULE.BLOCK_NUM)
+            {
+                block_num = GLOBAL_STATE->SYSTEM_MODULE.BLOCK_NUM;
+                #if 1
+                hideErrorScreen();
+                showFoundBlockScreen();
+                nvs_config_set_u16(NVS_CONFIG_BLOCK_NUM, block_num);
+                #endif
+            }
+        }
+        #endif
+
+        if(GLOBAL_STATE->SYSTEM_MODULE.overheat_mode)
+        {
+            showErrorScreen("OVER HEATED",HIGH_TEMPERATURE_ERROR);
+        }
+
+        if( GLOBAL_STATE->SYSTEM_MODULE.current_hashrate > 1)
+        {
+            if(GLOBAL_STATE->SYSTEM_MODULE.current_hashrate > current_hashrate_max)
+            {
+                current_hashrate_max = GLOBAL_STATE->SYSTEM_MODULE.current_hashrate;
+            }
+            if(GLOBAL_STATE->SYSTEM_MODULE.current_hashrate < current_hashrate_max/2)
+            {
+                hashrate_time_count ++;
+                #define  HASHRATE_ERROR_TIME_OUT (10*60*2)
+                if(hashrate_time_count > HASHRATE_ERROR_TIME_OUT)
+                {
+                    showErrorScreen("Hashrate too low",HASHRATE_ERROR);
+                    if(hashrate_time_count > (HASHRATE_ERROR_TIME_OUT + 1*60*2))
+                    {
+                        esp_restart();
+                    }
+                }
+            }
+            else
+            {
+                hashrate_time_count = 0;
+            }
+        }
+
+        if(found_nonce_time_stamps)
+        {
+            if((esp_timer_get_time() - found_nonce_time_stamps) > 120000000)
+            {
+                if (!GLOBAL_STATE->SYSTEM_MODULE.is_network_error) {
+                    showErrorScreen("Hashrate error",HASHRATE_ERROR);
+                }
+                if((esp_timer_get_time() - found_nonce_time_stamps) > 180000000)
+                {
+                    esp_restart();
+                }
+            }
+        }
+
+        displayFlashPro();
+
+        vTaskDelay(pdMS_TO_TICKS(500)); 
+        
+        static uint32_t time_last = 0;
+        static uint32_t now = 0;
+        now = esp_timer_get_time()/1000;
+
+        log_time = now - time_last;
+        if(log_time > 20*60*1000)
+        {
+            time_last = now;
+            
+            ESP_LOGI("system task", "temp: %.1f  %d  %" PRId8 " ", 
+                    GLOBAL_STATE->HEALTH_MODULE.cpu_temperature,read_power_temp(),
+                    GLOBAL_STATE->HEALTH_MODULE.board_temperature[0]
+                );
+            ESP_LOGI("system task", "Vin %.2f Vout %.2f Iout %.2f, Power %.0f",
+                GLOBAL_STATE->HEALTH_MODULE.input_voltage,
+                GLOBAL_STATE->HEALTH_MODULE.out_voltage,
+                GLOBAL_STATE->HEALTH_MODULE.out_current/1000,
+                GLOBAL_STATE->HEALTH_MODULE.power
+                );
+            ESP_LOGI("system task", "HASHRATE %.2fMH/S SHARES %"PRIu64 "",
+                GLOBAL_STATE->SYSTEM_MODULE.current_hashrate*1000,
+                GLOBAL_STATE->SYSTEM_MODULE.shares_accepted
+                );
+        }
+    }
+}
